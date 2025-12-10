@@ -4,17 +4,24 @@
 中央に NodeGraphQt のノードグラフを配置し、
 左右（および上下）にインスペクタとコンテンツブラウザの DockWidget を追加する。
 
-ユーザーは Dock をドラッグ＆ドロップして自由にレイアウトを変更できる。
+さらにメニューバーを実装し、File メニューからプロジェクトの
+保存／読み込み、Setting メニューから rez 環境管理ダイアログを開けるようにする。
 """
 
 from typing import Optional
 
 from PySide2.QtCore import Qt
-from PySide2.QtWidgets import QMainWindow, QWidget
+from PySide2.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QFileDialog,
+)
 
 from .node_graph import NodeGraphWidget
 from .inspector import InspectorDockWidget
 from .content_browser import ContentBrowserDockWidget
+from .environments_dialog import EnvironmentsDialog
+from .menu_api import load_menu_extensions
 
 
 class NodeEditorWindow(QMainWindow):
@@ -23,6 +30,12 @@ class NodeEditorWindow(QMainWindow):
 
     - 中央: NodeGraphWidget（NodeGraphQt のラッパ）
     - Dock: InspectorDockWidget, ContentBrowserDockWidget
+    - Menu:
+        - File
+            - Save: プロジェクト保存
+            - Open: プロジェクト読み込み
+        - Setting
+            - Environments...: rez 環境管理ダイアログをモーダル表示
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -36,6 +49,7 @@ class NodeEditorWindow(QMainWindow):
         """
         super().__init__(parent)
         self.setWindowTitle("Node Editor")
+        self.resize(1400, 900)
 
         self._node_graph_widget: Optional[NodeGraphWidget] = None
         self._inspector_dock: Optional[InspectorDockWidget] = None
@@ -44,6 +58,7 @@ class NodeEditorWindow(QMainWindow):
         self._setup_central_node_graph()
         self._setup_docks()
         self._setup_dock_options()
+        self._setup_menu_bar()
         self._setup_connections()
 
     # ------------------------------------------------------------------
@@ -85,6 +100,18 @@ class NodeEditorWindow(QMainWindow):
             | QMainWindow.AnimatedDocks
         )
 
+    def _setup_menu_bar(self) -> None:
+        """
+        メニューバーを初期化し、menu_ext パッケージからメニュー拡張を読み込む。
+
+        File / Setting を含むすべてのメニューは、menu_ext 側の拡張モジュールから
+        追加される前提とする。
+        """
+        # menuBar() を呼んでおけばメニューバー自体は必ず生成される
+        self.menuBar()
+        load_menu_extensions(self)
+
+
     def _setup_connections(self) -> None:
         """
         ノードグラフ・コンテンツブラウザとインスペクタの連携を設定する。
@@ -98,30 +125,91 @@ class NodeEditorWindow(QMainWindow):
 
         graph = self._node_graph_widget.graph
 
-        # ノードグラフ側で選択が変わったら、インスペクタをノードモードに。
+        # ノードグラフ側で選択が変わったら、インスペクタへ通知。
         graph.node_selection_changed.connect(self._on_graph_selection_changed)
 
-        # コンテンツブラウザで選択が変わったら、インスペクタに内容を表示。
+        # コンテンツブラウザで選択が変わったら、インスペクタへ通知。
         self._content_browser_dock.selection_changed.connect(
             self._on_content_selection_changed
         )
 
     # ------------------------------------------------------------------
-    # スロット
+    # Menu Action ハンドラ
+    # ------------------------------------------------------------------
+    def _on_action_save_project(self) -> None:
+        """
+        File > Save が押されたときに呼び出されるスロット。
+
+        NodeGraphQt.NodeGraph.save_session() を使用して、
+        ノード配置・接続・プロパティを JSON ファイルとして保存する。
+        """
+        if self._node_graph_widget is None:
+            return
+
+        graph = self._node_graph_widget.graph
+
+        dialog = QFileDialog(self, "Save Project")
+        dialog.setAcceptMode(QFileDialog.AcceptSave)
+        dialog.setNameFilters(["Project Files (*.json)", "All Files (*)"])
+        dialog.setDefaultSuffix("json")
+
+        if dialog.exec_() != QFileDialog.Accepted:
+            return
+
+        file_path = dialog.selectedFiles()[0]
+        if not file_path:
+            return
+
+        graph.save_session(file_path)
+
+    def _on_action_open_project(self) -> None:
+        """
+        File > Open が押されたときに呼び出されるスロット。
+
+        既存の JSON プロジェクトファイルを読み込み、
+        NodeGraphQt.NodeGraph.load_session() によりグラフを再構築する。
+        """
+        if self._node_graph_widget is None:
+            return
+
+        graph = self._node_graph_widget.graph
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Project",
+            "",
+            "Project Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+
+        graph.load_session(file_path)
+
+
+    def _on_action_open_environments(self) -> None:
+        """
+        Setting > Environments... が押されたときに呼び出されるスロット。
+
+        rez パッケージ管理用の環境設定ダイアログをモーダルで表示する。
+        実際の rez 連携ロジックは EnvironmentsDialog 側で今後実装していく。
+        """
+        dialog = EnvironmentsDialog(self)
+        dialog.exec_()
+
+    # ------------------------------------------------------------------
+    # グラフ / コンテンツ 連携スロット
     # ------------------------------------------------------------------
     def _on_graph_selection_changed(self, *_args, **_kwargs) -> None:
         """
-        ノードグラフ上の選択が変わったときに呼び出される。
+        ノードグラフ上のノード選択が変化したときに呼び出される。
 
-        ノードが 1 つ以上選ばれているときは先頭ノードをインスペクタに表示し、
-        何も選ばれていないときはインスペクタをクリアしてグレーアウトする。
+        選択ノードが 1 つ以上ある場合、先頭ノードをインスペクタに表示し、
+        何も選択されていない場合はインスペクタをクリアする。
         """
         if self._node_graph_widget is None or self._inspector_dock is None:
             return
 
-        graph = self._node_graph_widget.graph
-        selected = graph.selected_nodes()
-
+        selected = self._node_graph_widget.graph.selected_nodes()
         if not selected:
             self._inspector_dock.clear_all()
             return
@@ -129,10 +217,9 @@ class NodeEditorWindow(QMainWindow):
         node = selected[0]
         self._inspector_dock.show_node(node)
 
-
     def _on_content_selection_changed(self, content_id: str, label: str) -> None:
         """
-        コンテンツブラウザの選択が変わったときに呼び出される。
+        コンテンツブラウザで選択中の項目が変化したときに呼び出される。
 
         コンテンツ ID が空の場合はインスペクタをクリアし、
         そうでない場合はコンテンツ情報ページを表示する。
@@ -149,8 +236,6 @@ class NodeEditorWindow(QMainWindow):
             label=label,
             description="",
         )
-
-
 
     # ------------------------------------------------------------------
     # プロパティ

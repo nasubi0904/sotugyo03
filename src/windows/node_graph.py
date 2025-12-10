@@ -17,6 +17,9 @@ except ImportError as exc:  # pragma: no cover - 実行環境依存
         "NodeGraphQt がインポートできません。 "
         "仮想環境や requirements の設定を確認してください。"
     ) from exc
+    
+    
+from .node.base_nodes import register_all_tool_nodes
 
 
 class NodeGraphWidget(QWidget):
@@ -44,18 +47,17 @@ class NodeGraphWidget(QWidget):
     # --------------------------------------------------------------
     # 内部セットアップ
     # --------------------------------------------------------------
+
     def _setup_graph(self) -> None:
         """
         内部で保持する NodeGraph の初期設定とノード登録を行う。
 
-        ここでこのツール用のノードクラスをまとめて登録する。
+        base_nodes.register_all_tool_nodes() を呼び出すことで、
+        windows.node パッケージ配下の ToolBaseNode サブクラスが
+        すべて自動的に NodeGraph へ登録される。
         """
-        # ここでツール内のカスタムノードを登録
-        from .node.test_node import TestNode
+        register_all_tool_nodes(self._graph)
 
-        self._graph.register_node(TestNode)
-
-        # 必要であれば、今後ここで他のノードも register_node していく想定。
 
     def _setup_layout(self) -> None:
         """
