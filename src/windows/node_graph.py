@@ -17,9 +17,10 @@ except ImportError as exc:  # pragma: no cover - 実行環境依存
         "NodeGraphQt がインポートできません。 "
         "仮想環境や requirements の設定を確認してください。"
     ) from exc
-    
-    
+
+
 from .node.base_nodes import register_all_tool_nodes
+from .node.date_grid_node import DateGridNode
 
 
 class NodeGraphWidget(QWidget):
@@ -41,6 +42,10 @@ class NodeGraphWidget(QWidget):
         """
         super().__init__(parent)
         self._graph: NodeGraph = NodeGraph()
+
+        # Node の property 変更（特に pos）の監視
+        self._graph.property_changed.connect(self._on_graph_property_changed)
+
         self._setup_graph()
         self._setup_layout()
 
@@ -51,13 +56,10 @@ class NodeGraphWidget(QWidget):
     def _setup_graph(self) -> None:
         """
         内部で保持する NodeGraph の初期設定とノード登録を行う。
-
-        base_nodes.register_all_tool_nodes() を呼び出すことで、
-        windows.node パッケージ配下の ToolBaseNode サブクラスが
-        すべて自動的に NodeGraph へ登録される。
         """
+        # windows.node パッケージ配下の ToolBaseNode サブクラスを自動登録
         register_all_tool_nodes(self._graph)
-
+        # DateGridNode も ToolBaseNode を継承しているため、上記で自動登録される
 
     def _setup_layout(self) -> None:
         """
@@ -68,8 +70,30 @@ class NodeGraphWidget(QWidget):
         layout.addWidget(self._graph.widget)
 
     # --------------------------------------------------------------
+    # NodeGraph シグナルハンドラ
+    # --------------------------------------------------------------
+
+    def _on_graph_property_changed(self, node, prop_name, prop_value):
+        """
+        NodeGraph.property_changed シグナル用ハンドラ。
+
+        - ノードの位置 (pos) が変化したときだけ DateGridNode に通知し、
+          スナップ処理や DateGrid の自動レイアウトを行う。
+        """
+        if prop_name != "pos":
+            return
+
+        # DateGridNode 側にロジックをまとめているので、ここでは流すだけ
+        try:
+            DateGridNode.handle_node_moved(self._graph, node)
+        except Exception as e:
+            # デバッグ用に、クラッシュさせずにログだけ出す
+            print("[DateGridNode] handle_node_moved error:", e)
+
+    # --------------------------------------------------------------
     # プロパティ
     # --------------------------------------------------------------
+
     @property
     def graph(self) -> NodeGraph:
         """
