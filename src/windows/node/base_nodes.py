@@ -15,7 +15,6 @@ import pkgutil
 from typing import Iterable, List, Type
 
 from NodeGraphQt import BaseNode, NodeGraph
-from NodeGraphQt.constants import NodePropWidgetEnum
 
 
 class ToolBaseNode(BaseNode):
@@ -33,34 +32,48 @@ class ToolBaseNode(BaseNode):
     def __init__(self) -> None:
         """
         ToolBaseNode のインスタンスを初期化する。
-
-        共通の入出力ポートとプロパティを定義する。
         """
-        super().__init__()
+        super(ToolBaseNode, self).__init__()
 
-        # 共通のポート
+        # シンプルな in / out ポート
         self.add_input("in")
         self.add_output("out")
 
         # 共通プロパティ
-        self.create_property(
-            name="label",
-            value="",
-            widget_type=NodePropWidgetEnum.QLINE_EDIT.value,
-            widget_tooltip="ノードの表示用ラベル。",
-            tab="General",
-        )
-        self.create_property(
-            name="note",
-            value="",
-            widget_type=(
-                getattr(NodePropWidgetEnum, "QTEXT_EDIT", NodePropWidgetEnum.QLINE_EDIT)
-            ).value,
-            widget_tooltip="備考メモ。",
-            tab="General",
-        )
+        self.create_property("label", "")
+        self.create_property("note", "")
+
+    # ------------------------------------------------------------------ #
+    #  ノード移動フック
+    # ------------------------------------------------------------------ #
+    def set_pos(self, x: float, y: float) -> None:
+        """
+        ノードの位置が変わったときに DateGridNode 側へ通知するためのフック。
+
+        - 通常の挙動: 親クラスの set_pos を呼んで位置を更新
+        - その後、DateGridNode.on_node_moved を呼び出して
+          スナップ処理・子ノードの再レイアウトを行う
+        """
+        from .date_grid_node import DateGridNode  # 循環 import 回避のためローカル import
+
+        # いったん普通に位置を更新
+        super(ToolBaseNode, self).set_pos(x, y)
+
+        # スナップ処理中の再帰呼び出しは無視
+        if getattr(self, "_kdm_snapping", False):
+            return
+
+        graph = self.graph
+        if not graph:
+            return
+
+        # DateGrid 側に「このノードが動いた」という情報を通知
+        DateGridNode.on_node_moved(graph, self)
 
 
+# ---------------------------------------------------------------------- #
+#  ノード自動発見 / 登録
+# ---------------------------------------------------------------------- #
 def iter_tool_node_classes() -> Iterable[Type[ToolBaseNode]]:
     """
     windows.node パッケージ内から ToolBaseNode のサブクラスを自動列挙する。
@@ -74,17 +87,12 @@ def iter_tool_node_classes() -> Iterable[Type[ToolBaseNode]]:
     Iterable[Type[ToolBaseNode]]
         発見された ToolBaseNode サブクラスのイテレータ。
     """
-    # このモジュールは windows.node.base_nodes なので、
-    # 親パッケージ windows.node を特定する
-    package_name = __name__.rsplit(".", 1)[0]  # -> 'windows.node'
+    # このモジュールは windows.node.base_nodes
+    package_name = __name__.rsplit(".", 1)[0]
     package = importlib.import_module(package_name)
 
-    # パッケージ直下のモジュールを走査
     for module_info in pkgutil.iter_modules(package.__path__):
-        # 自分自身（base_nodes.py）はスキップ
-        if module_info.name == "base_nodes":
-            continue
-        # アンダースコア始まりのモジュールもスキップ（内部用想定）
+        # 先頭が '_' のモジュールはスキップ
         if module_info.name.startswith("_"):
             continue
 
@@ -100,14 +108,9 @@ def iter_tool_node_classes() -> Iterable[Type[ToolBaseNode]]:
             yield obj
 
 
-def collect_tool_node_classes() -> List[Type[ToolBaseNode]]:
+def list_tool_node_classes() -> List[Type[ToolBaseNode]]:
     """
-    ToolBaseNode サブクラスをすべてリストにまとめて返すヘルパー。
-
-    Returns
-    -------
-    list[Type[ToolBaseNode]]
-        発見された ToolBaseNode サブクラスの一覧。
+    ToolBaseNode サブクラスをリストとして取得する補助関数。
     """
     return list(iter_tool_node_classes())
 

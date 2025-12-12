@@ -3,301 +3,226 @@ from __future__ import annotations
 """
 DateGridNode
 
-- 他ノードを「背景グリッド」上に縦方向へスナップ配置するノード。
-- DateGridNode 自身は常に他ノードの背面に描画される（Z 値を低く設定）。
-- スナップされたノードの情報はプロパティとして保持し、
-  Inspector の note から一覧を確認できる。
+- 他ノードを「自ノードの矩形領域内」にスナップさせて保持するコンテナノード。
+- つねに最背面に描画される（他ノードの背景として振る舞う）。
+- 他ノードがドラッグ＆ドロップで移動され、位置確定したときに
+  自ノード領域と重なっていれば自動で内部にスナップし、
+  子ノードの配置に合わせて自ノードのサイズ（高さ中心）を伸縮させる。
 """
 
-from typing import List, Dict, Optional
+from typing import Iterable, List, Optional
 
-from .base_nodes import ToolBaseNode  # 共通ベースノード :contentReference[oaicite:3]{index=3}
+from PySide2.QtCore import QRectF
+from NodeGraphQt import BaseNode, NodeGraph
+
+from .base_nodes import ToolBaseNode
 
 
 class DateGridNode(ToolBaseNode):
     """
-    タイムライン用の「背景グリッド」ノード。
+    日付（または任意のグループ）単位で他ノードをまとめるための背景ノード。
 
-    - 常にほかのノードより背面に描画される
-    - 横幅は他ノードと同一幅で固定（最初にスナップされたノードを基準）
-    - 縦方向に自由に伸縮できる
-    - 上辺付近の「スナップエリア」にドラッグして近づけたノードを
-      自動で縦方向に整列させ、内部でその情報を保持する
-    - DateGridNode 同士の入れ子は許可しない
+    - ToolBaseNode を継承しているが、ポート自体は使わなくてもよい想定
+    - 自身は「背景」として常に最背面に描画
+    - graph 上で他ノードが動かされたときに、自領域と重なっていれば
+      自動的に内部へスナップして縦に整列させる
     """
 
     __identifier__ = ToolBaseNode.__identifier__
-    NODE_NAME = "Date Grid"
+    NODE_NAME = "Date"
 
-    # スナップエリアの高さ（ピクセル）
-    SNAP_AREA_HEIGHT = 40
-    # グリッドの最小高さ
-    MIN_HEIGHT = 120
-    # ノード同士の縦間隔
-    V_SPACING = 10
-    # 左側マージン
-    H_MARGIN = 10
-
+    # ------------------------------------------------------------------ #
+    #  初期化
+    # ------------------------------------------------------------------ #
     def __init__(self) -> None:
-        super().__init__()
+        super(DateGridNode, self).__init__()
 
-        # 背景ノードっぽい色
-        self.set_color(60, 60, 80)
+        # デフォルト名
+        self.set_name("Date")
 
-        # 初期サイズ（他ノードと同じくらいの幅）
-        self.set_property("width", 220.0)
-        self.set_property("height", float(self.MIN_HEIGHT))
+        # 背景っぽく見えるように幅・高さをやや大きめに
+        self.set_property("width", 260.0)
+        self.set_property("height", 180.0)
 
-        # 常に背面に描画
+        # スナップ関連プロパティ
+        # children: 内部にスナップしているノードの id リスト
+        self.create_property("children", [])  # type: ignore[func-returns-value]
+        self.create_property("padding_x", 20.0)
+        self.create_property("padding_y", 30.0)
+        self.create_property("spacing_y", 10.0)
+
+        # DateGrid は背景なので常に最背面へ
+        # （他ノードよりかなり小さい Z 値にしておく）
         if self.view is not None:
-            try:
-                self.view.setZValue(-1000)
-            except Exception:
-                pass
+            self.view.setZValue(-10000.0)
 
-        # スナップされたノード ID のリスト（シリアライズ対象・UI は出さない）
-        self.create_property(
-            name="snap_nodes",
-            value=[],
-            widget_type=None,
-            widget_tooltip="Date Grid にスナップされているノードの ID 一覧。",
-            tab="Date Grid",
-        )
-
-        # インスペクタ初期文言（note は Inspector で表示される）:contentReference[oaicite:4]{index=4}
-        self.set_property("note", "スナップされたノード: なし")
-
-        # ツールチップでスナップエリアを説明
-        try:
-            self.set_tooltip("上部 40px がスナップエリアです。近づけると自動で整列します。")
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    #  Graph 側から呼ばれるクラスメソッド（ドラッグ時の自動スナップ）
-    # ------------------------------------------------------------------
-    @classmethod
-    def handle_node_moved(cls, graph, moved_node) -> None:
+    # ------------------------------------------------------------------ #
+    #  ヘルパー
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _node_scene_rect(node: BaseNode) -> Optional[QRectF]:
         """
-        NodeGraph.property_changed("pos") から呼ばれる想定の処理。
+        ノードの「シーン座標系での矩形」を取得する。
+        """
+        item = getattr(node, "view", None)
+        if item is None:
+            return None
+        # QGraphicsItem.sceneBoundingRect() をそのまま利用
+        return item.sceneBoundingRect()
 
-        - moved_node が DateGridNode 自身 … ぶら下がっているノードを再レイアウト
-        - moved_node が ToolBaseNode     … DateGrid へのスナップ / 解除を判定
+    def _children_ids(self) -> List[str]:
+        """
+        プロパティ上の children を常に list[str] として返す。
+        """
+        value = self.get_property("children")
+        if isinstance(value, list):
+            return list(value)
+        return []
+
+    # ------------------------------------------------------------------ #
+    #  ノード移動時のスナップ処理（ToolBaseNode から呼ばれる）
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def on_node_moved(cls, graph: NodeGraph, moved_node: BaseNode) -> None:
+        """
+        他ノードが移動したときに、全ての DateGridNode に対して
+        「そのノードを受け入れるかどうか」を判定させるクラスメソッド。
+
+        Parameters
+        ----------
+        graph:
+            NodeGraph インスタンス。
+        moved_node:
+            位置が更新されたノード。
         """
         if graph is None or moved_node is None:
             return
 
-        # すべての DateGridNode を取得
-        date_nodes: List[DateGridNode] = [
-            n for n in graph.all_nodes()
-            if isinstance(n, DateGridNode)
-        ]
-        if not date_nodes:
+        # DateGrid 自身が動いたときは、ここでは何もしない
+        if isinstance(moved_node, cls):
             return
 
-        # DateGridNode 自身が動いた場合 → 自分の子だけ再レイアウト
-        if isinstance(moved_node, DateGridNode):
-            moved_node._layout_snapped_nodes()
-            return
+        for node in graph.all_nodes():
+            if isinstance(node, cls):
+                node._update_membership(moved_node)
 
-        # それ以外で、ToolBaseNode 以外はスナップ対象外
-        if not isinstance(moved_node, ToolBaseNode):
-            return
-        # DateGridNode は入れ子禁止
-        if isinstance(moved_node, DateGridNode):
-            return
-
-        moved_id = moved_node.id
-
-        # もともとどの DateGrid に属していたか
-        current_parent: Optional[DateGridNode] = None
-        for dn in date_nodes:
-            if moved_id in dn._get_snap_ids():
-                current_parent = dn
-                break
-
-        # 現在位置でどの DateGrid のスナップエリア内にいるか
-        target_parent: Optional[DateGridNode] = None
-        for dn in date_nodes:
-            if dn._is_in_snap_area(moved_node):
-                target_parent = dn
-                break
-
-        # どこにも入っていない → 以前の親から外すだけ
-        if target_parent is None:
-            if current_parent is not None:
-                ids = current_parent._get_snap_ids()
-                if moved_id in ids:
-                    ids.remove(moved_id)
-                    current_parent._set_snap_ids(ids)
-                    current_parent._layout_snapped_nodes()
-            return
-
-        # 別の DateGrid に移動した場合：元から削除して新しい DateGrid に追加
-        if current_parent is not None and current_parent is not target_parent:
-            ids = current_parent._get_snap_ids()
-            if moved_id in ids:
-                ids.remove(moved_id)
-                current_parent._set_snap_ids(ids)
-                current_parent._layout_snapped_nodes()
-
-        # target_parent へ登録
-        ids = target_parent._get_snap_ids()
-        if moved_id not in ids:
-            ids.append(moved_id)
-            target_parent._set_snap_ids(ids)
-        target_parent._layout_snapped_nodes()
-
-    # ------------------------------------------------------------------
-    #  内部ユーティリティ
-    # ------------------------------------------------------------------
-    def _get_size(self) -> (float, float):
-        w = self.get_property("width")
-        h = self.get_property("height")
-        if not isinstance(w, (int, float)):
-            w = 220.0
-        if not isinstance(h, (int, float)):
-            h = float(self.MIN_HEIGHT)
-        return float(w), float(h)
-
-    def _grid_rect(self) -> Dict[str, float]:
+    # ------------------------------------------------------------------ #
+    #  個々の DateGrid 側での membership 判定
+    # ------------------------------------------------------------------ #
+    def _update_membership(self, moved_node: BaseNode) -> None:
         """
-        現在の DateGrid の矩形情報を返す。
-        """
-        x, y = self.pos()
-        w, h = self._get_size()
-        return {"x": float(x), "y": float(y), "w": w, "h": h}
-
-    def _is_in_snap_area(self, node: ToolBaseNode) -> bool:
-        """
-        ノードの中心が DateGrid のスナップエリア付近にあるか判定。
-
-        - X 方向: DateGrid の幅内
-        - Y 方向: DateGrid 上端から SNAP_AREA_HEIGHT 以内
-        """
-        rect = self._grid_rect()
-        nx, ny = node.pos()
-        # ヘッダ高さをざっくり 30px として中心を推定
-        cx = float(nx) + rect["w"] * 0.5
-        cy = float(ny) + 30.0
-
-        in_x = rect["x"] <= cx <= rect["x"] + rect["w"]
-        in_y = rect["y"] <= cy <= rect["y"] + self.SNAP_AREA_HEIGHT
-        return in_x and in_y
-
-    def _get_snap_ids(self) -> List[str]:
-        ids = self.get_property("snap_nodes") or []
-        if not isinstance(ids, list):
-            return []
-        return [str(i) for i in ids]
-
-    def _set_snap_ids(self, ids: List[str]) -> None:
-        self.set_property("snap_nodes", list(ids))
-        self._update_note_from_snap_ids()
-
-    def _update_note_from_snap_ids(self) -> None:
-        """
-        snap_nodes の内容から note テキストを組み立て、インスペクタに表示する。
-        """
-        graph = self.graph
-        ids = self._get_snap_ids()
-        if graph is None or not ids:
-            self.set_property("note", "スナップされたノード: なし")
-            return
-
-        lines: List[str] = ["スナップされたノード:"]
-        for idx, nid in enumerate(ids, start=1):
-            node = graph.get_node_by_id(nid)
-            if node is None:
-                continue
-            lines.append(f"{idx}: {node.name()} (id={nid})")
-
-        self.set_property("note", "\n".join(lines))
-
-    # ------------------------------------------------------------------
-    #  スナップ済みノードのレイアウト処理
-    # ------------------------------------------------------------------
-    def _layout_snapped_nodes(self) -> None:
-        """
-        snap_nodes に登録されているノードを
-
-        - 左端位置を揃え
-        - 縦方向にきれいに並べ
-        - その結果に合わせて DateGrid 自身の高さを自動調整し
-        - 横幅は「最初にスナップされたノードの幅」で固定する
-
-        というレイアウトを行う。
+        指定された moved_node を「自分の子として扱うか」を判定し、
+        必要であれば children リストを更新して全子ノードを再レイアウトする。
         """
         graph = self.graph
         if graph is None:
             return
 
-        ids = self._get_snap_ids()
-        if not ids:
-            # 何もないときは高さだけ最低値に戻す
-            w, _ = self._get_size()
-            self.set_property("width", w)
-            self.set_property("height", float(self.MIN_HEIGHT))
-            self._update_note_from_snap_ids()
+        my_rect = self._node_scene_rect(self)
+        other_rect = self._node_scene_rect(moved_node)
+        if my_rect is None or other_rect is None:
             return
 
-        # 実在するノードだけ抽出（削除されたノードをクリーンアップ）
-        nodes: List[ToolBaseNode] = []
-        for nid in ids:
+        children_ids = self._children_ids()
+        is_child = moved_node.id in children_ids
+
+        intersects = my_rect.intersects(other_rect)
+
+        updated = False
+
+        if intersects and not is_child:
+            # 新しく自分の子として受け入れる
+            children_ids.append(moved_node.id)
+            updated = True
+        elif (not intersects) and is_child:
+            # 領域から外れたので子リストから除外
+            children_ids.remove(moved_node.id)
+            updated = True
+
+        # 交差状態に変化がなければ何もしない
+        if not updated:
+            return
+
+        # 実際に存在するノードだけに絞る
+        child_nodes: List[BaseNode] = []
+        for nid in children_ids:
             node = graph.get_node_by_id(nid)
-            if node is None:
+            if node is None or node is self:
                 continue
-            if isinstance(node, DateGridNode):
-                # 入れ子禁止
-                continue
-            if not isinstance(node, ToolBaseNode):
-                continue
-            nodes.append(node)
+            child_nodes.append(node)
 
-        if not nodes:
-            self._set_snap_ids([])
+        # 子ノード id を再保存
+        self.set_property("children", [n.id for n in child_nodes])
+
+        # 子ノードがいなくなった場合は高さだけ最小値にして終了
+        if not child_nodes:
+            self._shrink_to_min_height()
             return
 
-        # Y 位置でソートして縦並び順を決定
-        nodes.sort(key=lambda n: n.pos()[1])
+        # 子ノードを縦に並べて、自分のサイズを合わせる
+        self._layout_children(child_nodes)
 
-        # 基準幅：最初のノードの現在 width（なければ 220）
-        first_w = nodes[0].get_property("width")
-        if not isinstance(first_w, (int, float)):
-            first_w = 220.0
-        base_width = float(first_w)
+    # ------------------------------------------------------------------ #
+    #  レイアウト処理
+    # ------------------------------------------------------------------ #
+    def _layout_children(self, children: Iterable[BaseNode]) -> None:
+        """
+        children 内のノードを自分の内部に縦に整列させ、
+        その結果に合わせて自ノードの幅・高さを更新する。
+        """
+        graph = self.graph
+        if graph is None:
+            return
 
-        # DateGrid 自身の幅もそれに合わせる
-        self.set_property("width", base_width)
+        rect = self._node_scene_rect(self)
+        if rect is None:
+            return
 
-        rect = self._grid_rect()
-        x = rect["x"]
-        y = rect["y"]
+        padding_x = float(self.get_property("padding_x") or 0.0)
+        padding_y = float(self.get_property("padding_y") or 0.0)
+        spacing_y = float(self.get_property("spacing_y") or 0.0)
 
-        current_y = y + self.SNAP_AREA_HEIGHT + self.V_SPACING
-        max_bottom = current_y
+        # 子ノード配置開始位置（自分の左上からのオフセット）
+        x = rect.left() + padding_x
+        y = rect.top() + padding_y
 
-        # 実際にノードを縦に並べる
-        for node in nodes:
-            # ノードの高さ（view.height があれば利用）
-            nh = getattr(node.view, "height", 60.0)
-            nh = float(nh)
+        max_right = rect.right()
+        max_bottom = rect.bottom()
 
-            # 横幅を揃える
-            try:
-                node.set_property("width", base_width - self.H_MARGIN * 2.0)
-            except Exception:
-                pass
+        # 再配置中は ToolBaseNode.set_pos からの再帰を防ぐ
+        children_list = list(children)
+        for n in children_list:
+            setattr(n, "_kdm_snapping", True)
 
-            target_x = x + self.H_MARGIN
-            node.set_pos(target_x, current_y)
+        try:
+            for node in children_list:
+                # 子ノードを順番に縦に並べる
+                node.set_pos(x, y)
 
-            current_y += nh + self.V_SPACING
-            max_bottom = max(max_bottom, current_y)
+                child_rect = self._node_scene_rect(node)
+                if child_rect is None:
+                    continue
 
-        # DateGrid の高さを子ノードの終端まで伸ばす
-        new_height = max(float(self.MIN_HEIGHT), max_bottom - y + self.V_SPACING)
-        self.set_property("height", new_height)
+                max_right = max(max_right, child_rect.right() + padding_x)
+                y = child_rect.bottom() + spacing_y
+                max_bottom = max(max_bottom, y)
+        finally:
+            for n in children_list:
+                setattr(n, "_kdm_snapping", False)
 
-        # note 更新
-        self._update_note_from_snap_ids()
+        # 自分自身のサイズを、子ノードの末端 + パディング に合わせて更新
+        new_width = max_right - rect.left()
+        new_height = max_bottom - rect.top() + padding_y
+
+        # NodeGraphQt では width / height プロパティを書き換えることで
+        # ノードのサイズを制御できる 
+        self.set_property("width", float(new_width))
+        self.set_property("height", float(new_height))
+
+    def _shrink_to_min_height(self) -> None:
+        """
+        子ノードがなくなったときに最小高さまで戻す。
+        """
+        padding_y = float(self.get_property("padding_y") or 0.0)
+        min_height = max(120.0, 2 * padding_y + 40.0)
+        self.set_property("height", float(min_height))
